@@ -329,7 +329,7 @@ class emulator:
                 idx = np.argmax(avg_mice, axis=0)
                 return idx, avg_mice[idx,np.arange(avg_mice.shape[1])]
 
-    def metric(self, x_cand, method='ALM',nugget_s=1.,score_only=False):
+    def metric(self, x_cand, method='ALM',nugget_s=1.,score_only=False,top_n=1):
         """Compute the value of the ALM or MICE criterion for sequential designs.
 
         Args:
@@ -352,8 +352,13 @@ class emulator:
         """
         if x_cand.ndim==1:
             raise Exception('The candidate design set has to be a numpy 2d-array.')
+        # if self.all_layer[self.n_layer-1][0].type=='likelihood':
+        #     raise Exception('The method is only applicable to DGPs without likelihood layers.')
         if self.all_layer[self.n_layer-1][0].type=='likelihood':
-            raise Exception('The method is only applicable to DGPs without likelihood layers.')
+            llik_kernel_in=True
+        else:
+            llik_kernel_in=False
+
         if method == 'ALM':
             _, sigma2 = self.predict(x=x_cand)
             if score_only:
@@ -362,27 +367,84 @@ class emulator:
                 idx = np.argmax(sigma2, axis=0)
                 return idx, sigma2[idx,np.arange(sigma2.shape[1])]
         elif method == 'MICE':
-            predicted_input, sigma2 = self.predict_mice(x_cand)
-            M=len(x_cand)
-            D=len(self.all_layer[-1])
-            mice=np.zeros((M,D))
-            S=len(self.all_layer_set)
-            for i in range(S):
-                last_layer=self.all_layer_set[i][-1]
-                sigma2_s_i=np.empty((M,D))
-                for k in range(D):
-                    kernel = last_layer[k]
-                    sigma2_s_i[:,k] = mice_var(predicted_input[i], x_cand, copy.deepcopy(kernel), nugget_s).flatten()
-                with np.errstate(divide='ignore'):
-                    mice =+ np.log(sigma2[i]/sigma2_s_i)
-            avg_mice=mice/S
+            if not llik_kernel_in:
+                predicted_input, sigma2 = self.predict_mice(x_cand, llik_kernel_in)
+                M=len(x_cand)
+                D=len(self.all_layer[-1])
+                mice=np.zeros((M,D))
+                S=len(self.all_layer_set)
+                for i in range(S):
+                    last_layer=self.all_layer_set[i][-1]
+                    sigma2_s_i=np.empty((M,D))
+                    for k in range(D):
+                        kernel = last_layer[k]
+                        sigma2_s_i[:,k] = mice_var(predicted_input[i], x_cand, copy.deepcopy(kernel), nugget_s).flatten()
+                    with np.errstate(divide='ignore'):
+                        mice =+ np.log(sigma2[i]/sigma2_s_i)
+                avg_mice=mice/S
+            else:
+                predicted_input_mean, predicted_input_var, sigma2 = self.predict_mice(x_cand, llik_kernel_in)
+                M=len(x_cand)
+                D=len(self.all_layer[-1])
+                assert D==1, 'The method is only applicable to DGPs with one output dimension.'
+                K=len(self.all_layer[-2])
+                assert K==2, 'The method is only applicable to DGPs with two latent layers before heterolikelihood kernel.'
+                C=len(self.all_layer[-3])
+
+
+
+                mice=np.zeros((M,D))
+
+                S=len(self.all_layer_set)
+                predicted_mean_kernel_into_llik_kernel=np.empty((S,M,K))
+                predicted_var_kernel_into_llik_kernel=np.empty((S,M,K))
+
+                for i in range(S):
+                    m = predicted_input_mean[i]
+                    v = predicted_input_var[i]
+
+                    # Get the results of the last gp layer
+                    # ------------------------------------ #
+                    mean_kernel_before_last_layer = self.all_layer_set[i][-2][0]
+                    if mean_kernel_before_last_layer.connect is not None:
+                        z = x_cand[:,mean_kernel_before_last_layer.connect]
+                    else:
+                        z = None
+                    
+                    predicted_mean_kernel_into_llik_kernel[i,:,0], predicted_mean_kernel_into_llik_kernel[i,:,1] = \
+                    mean_kernel_before_last_layer.linkgp_prediction(m=m, v=v, z=z, nb_parallel=self.nb_parallel)
+
+
+                    var_kernel_before_last_layer = self.all_layer_set[i][-2][1]
+                    if var_kernel_before_last_layer.connect is not None:
+                        z = x_cand[:,var_kernel_before_last_layer.connect]
+                    else:
+                        z = None
+                    predicted_var_kernel_into_llik_kernel[i,:,0], predicted_var_kernel_into_llik_kernel[i,:,1] = \
+                    var_kernel_before_last_layer.linkgp_prediction(m=m, v=v, z=z, nb_parallel=self.nb_parallel)
+                    # ------------------------------------ #
+
+                    last_layer=self.all_layer_set[i][-1]
+                    sigma2_s_i=np.empty((M,D))
+                    for k in range(D):
+                        kernel = last_layer[k]
+                        sigma2_s_i[:,k] = mice_var(predicted_mean_kernel_into_llik_kernel[i], x_cand, copy.deepcopy(kernel), nugget_s, 
+                                                   predicted_var_kernel_into_llik_kernel[i]).flatten()
+                    with np.errstate(divide='ignore'):
+                        print('nominator: ', sigma2[i][0])
+                        print('denominator: ', sigma2_s_i[0])
+                        mice =+ np.log(sigma2[i]/sigma2_s_i)
+                avg_mice=mice/S
             if score_only:
                 return avg_mice
             else:
-                idx = np.argmax(avg_mice, axis=0)
-                return idx, avg_mice[idx,np.arange(avg_mice.shape[1])]
+                # idx = np.argmax(avg_mice, axis=0)
+                idx = np.argpartition(avg_mice,-top_n, axis=0)[-top_n:]
+                # sort the indices by decending the criterion values
+                idx = idx[np.argsort(avg_mice[idx], axis=0)].flatten()[::-1]                
+                return x_cand[idx], avg_mice[idx, np.arange(avg_mice.shape[1])]
             
-    def predict_mice(self,x_cand):
+    def predict_mice(self,x_cand,llik_kernel_in):
         """Implement predictions from the trained DGP model that are required to calculate the MICE criterion.
         """
         S=len(self.all_layer_set)
@@ -390,6 +452,9 @@ class emulator:
         D=len(self.all_layer[-1])
         variance_pred_set=[]
         pred_input_set=[]
+        if llik_kernel_in:
+            pred_var_input_set=[]
+
         #start calculation
         for i in range(S):
             one_imputed_all_layer=self.all_layer_set[i]
@@ -414,13 +479,24 @@ class emulator:
                     for k in range(n_kerenl):
                         kernel=layer[k]
                         m_k_in,v_k_in=overall_test_input_mean[:,kernel.input_dim],overall_test_input_var[:,kernel.input_dim]
-                        if kernel.connect is not None:
-                            z_k_in=overall_global_test_input[:,kernel.connect]
+                        
+                        # ====================================== #
+                        if kernel.type == 'likelihood':
+                            _,v_k = kernel.prediction(m=m_k_in,v=v_k_in)
                         else:
-                            z_k_in=None
-                        _,v_k=kernel.linkgp_prediction(m=m_k_in,v=v_k_in,z=z_k_in,nb_parallel=self.nb_parallel)
+                            if kernel.connect is not None:
+                                z_k_in=overall_global_test_input[:,kernel.connect]
+                            else:
+                                z_k_in=None
+                            _,v_k=kernel.linkgp_prediction(m=m_k_in,v=v_k_in,z=z_k_in,nb_parallel=self.nb_parallel)
                         variance_pred[:,k]=v_k
+                        # ====================================== #
+
                 else:
+                    # ====================================== #
+                    if llik_kernel_in and l==self.n_layer-2:
+                        break
+                    # ====================================== #
                     for k in range(n_kerenl):
                         kernel=layer[k]
                         m_k_in,v_k_in=overall_test_input_mean[:,kernel.input_dim],overall_test_input_var[:,kernel.input_dim]
@@ -433,7 +509,13 @@ class emulator:
                     overall_test_input_mean,overall_test_input_var=overall_test_output_mean,overall_test_output_var
             variance_pred_set.append(variance_pred)
             pred_input_set.append(overall_test_input_mean)
-        return pred_input_set, variance_pred_set
+            if llik_kernel_in:
+                pred_var_input_set.append(overall_test_input_var)
+
+        if llik_kernel_in:  
+            return pred_input_set, pred_var_input_set, variance_pred_set
+        else:
+            return pred_input_set, variance_pred_set
 
     def ppredict(self,x,method='mean_var',full_layer=False,sample_size=50,chunk_num=None,core_num=None):
         """Implement parallel predictions from the trained DGP model.
@@ -708,6 +790,3 @@ class emulator:
         nllik=-np.log(np.mean(predicted_lik,axis=0)).flatten()
         average_nllik=np.mean(nllik)
         return average_nllik, nllik
-
-        
-      

@@ -173,17 +173,21 @@ def inv_swp(X,k):
     return T[:,mask][mask,:]
 
 ######MICE smooth pred var calculation######
-def mice_var(x, x_extra, kernel, nugget_s):
+def mice_var(x, x_extra, kernel, nugget_s, x_var=None):
     """Calculate smoothed predictive variances of the GP using the candidate design set.
     """
-    kernel.input=x[:,kernel.input_dim]
-    if kernel.connect is not None:
-        kernel.global_input=x_extra[:,kernel.connect]
-    kernel.nugget=max(nugget_s,kernel.nugget)
-    R=kernel.k_matrix()
-    Rinv=pinvh(R,check_finite=False)
-    sigma2 = (1/np.diag(Rinv)).reshape(-1,1)
-    sigma2 = kernel.scale*sigma2
+    if kernel.type=="likelihood":
+        # assert x_var != None, "input variance must be provided for hetero-likelihood kernel"
+        _, sigma2 = kernel.prediction(m=x, v=x_var)
+    else:
+        kernel.input=x[:,kernel.input_dim]
+        if kernel.connect is not None:
+            kernel.global_input=x_extra[:,kernel.connect]
+        kernel.nugget=max(nugget_s,kernel.nugget)
+        R=kernel.k_matrix()
+        Rinv=pinvh(R,check_finite=False)
+        sigma2 = (1/np.diag(Rinv)).reshape(-1,1)
+        sigma2 = kernel.scale*sigma2
     return sigma2
 
 ######functions for predictions########
