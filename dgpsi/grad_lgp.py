@@ -5,6 +5,8 @@ from dgpsi.vecchia import K_vec_nb
 from dgpsi.functions import k_one_vec
 
 core_num = cpu_count(logical = False)
+max_threads = config.NUMBA_NUM_THREADS
+core_num = min(core_num, max_threads)
 config.THREADING_LAYER = 'workqueue'
 set_num_threads(core_num)
 
@@ -22,7 +24,7 @@ def gp_pred(x,z,Rinv,Rinv_y,scale,length,nugget,name):
         v[i] = np.abs(scale*(1+nugget-r_Rinv_r))[0]
     return m, v
 
-# @njit(cache=True)
+@njit(cache=True)
 def epsilon_sexp_with_derivative(x, z_m, z_v, length, scale):
     """ compute the epsilon function in the I function.
     N is the number of samples
@@ -83,8 +85,7 @@ def sexp_k_one_vector_derivative(x_star, X, length, scale):
     grad_k = - 2 * diff / length**2 * k_values[:, :, None]  # Broadcasting k_values to shape (M, N, D)
     return grad_k 
 
-
-
+sqrt_5 = np.sqrt(5.0)
 @njit(cache=True)
 def matern_k_one_vector_derivative(x_star, X, length, scale):
     """
@@ -108,11 +109,13 @@ def matern_k_one_vector_derivative(x_star, X, length, scale):
     diff = x_star[:, None, :] - X[None, :, :]  # Shape: (M, N, D)
     # Compute squared distances and distances
     sq_dist = np.sum(diff ** 2, axis=-1)  # Shape: (M, N)
+    # r = diff
+    # r = np.sum(np.abs(diff), axis=-1)  # Shape: (M, N, D)
     r = np.sqrt(sq_dist + 1e-12)  # Add a small value to avoid division by zero
     # Compute constants
-    sqrt_5 = np.sqrt(5.0)
     l = length
     # Compute the kernel values
+
     A = (1.0 + (sqrt_5 * r) / l + (5.0 * r ** 2) / (3.0 * l ** 2))
     exp_part = np.exp(-sqrt_5 * r / l)
     # k_values = A * exp_part  # Shape: (M, N)
@@ -129,9 +132,10 @@ def matern_k_one_vector_derivative(x_star, X, length, scale):
     grad_k = (dk_dr * inv_r)[:, :, None] * diff  # Broadcasting to shape (M, N, D)
     return grad_k
 
+    
 
 
-def nabla_sexp_I(x_star:np.array, all_layers:list):
+def nabla_sexp_I(x_star:np.array, all_layers:list, return_variance=True):
     """Compute the nabla of the I function for the squared exponential kernel.
     input: x_star: the input point
            all_layers: all layers in the DGP model
@@ -153,6 +157,7 @@ def nabla_sexp_I(x_star:np.array, all_layers:list):
     var_first_layer = np.zeros((M, num_gp_nodes))
     dmu_dx = np.zeros((M, num_gp_nodes, D, 1)) 
     dvar_dx = np.zeros((M, num_gp_nodes, D, 1))
+    # var_dx_1 = np.zeros((M, num_gp_nodes, D))
 
     for p in range(num_gp_nodes):
         Rinv = first_layer[p].Rinv
@@ -176,7 +181,7 @@ def nabla_sexp_I(x_star:np.array, all_layers:list):
             d_k_one_vector_d_x_star = matern_k_one_vector_derivative(x_star, w1, length, scale)
         else:
             raise ValueError("Only support squared exponential and Matern-2.5 kernel now.")
-        d_k_one_vector_d_x_star = sexp_k_one_vector_derivative(x_star, w1, length, scale) # Shape: (M, N, D)
+        
         d_k_one_vector_d_x_star_transpose = np.transpose(d_k_one_vector_d_x_star, (0, 2, 1)) # Shape: (M, D, N)
         dmu_dx[:,p,:,:] = np.einsum('mdn,n->md', d_k_one_vector_d_x_star_transpose, Rinv_y)[:,:,None] # Shape: (M, D, 1)
 
@@ -184,7 +189,11 @@ def nabla_sexp_I(x_star:np.array, all_layers:list):
         # print(k_one_vec(x_star, w1, length, name).shape)
         term1 = np.einsum('mdn,mn->md', term1, k_one_vec(x_star, w1, length, name))[:,:,None]# Shape: (M, D, 1)
         dvar_dx[:,p,:,:] = scale*term1
+
+        # var_dx_1[:,p,:] = np.clip(scale/length**2 - term1, 1e-12, None)[:,:,0]
+        # print(var_dx_1[:,p,:].mean())
     w1 = second_layer[0].input
+    scale = second_layer[0].scale[0]
     
     # ============ epsilon function ============
     epsilon_xstar, d_epsilon_dz_m, d_epsilon_dz_v = epsilon_sexp_with_derivative(w1, 
@@ -192,10 +201,32 @@ def nabla_sexp_I(x_star:np.array, all_layers:list):
                                                     var_first_layer, 
                                                     np.array([second_layer[0].length[0] for i in range(num_gp_nodes)]),
                                                     scale=scale)
+    
+    # approxiamte the variance of the deep GP
+    # Var(\nabla f_l(x_star)) = (1) \nabla f_{l-1}(x_star)^T * Var(f_l(x_star)) * \nabla f_{l-1}(x_star) 
+    #                           (2) + Var(\nabla f_{l}(w_star|x_star))
+    # (1)
+    # shape of dmu_dx: (M, Num_gp_nodes, D, 1)
+    dmu_dx_T = np.transpose(dmu_dx, axes=(0, 2, 1, 3)) # shape: (M, D, Num_gp_nodes, 1)
+
+    nabla_rw = sexp_k_one_vector_derivative(mu_first_layer, w1, second_layer[0].length, scale) # Shape: (M, N, G)
+    nabla_rw_T = np.transpose(nabla_rw, axes=(0, 2, 1)) # Shape: (M, G, N)
+    # dmu2_dw = np.einsum('mdn,n->md', nabla_rw_T,
+    #                     second_layer[0].Rinv_y) # shape: (M, Num_gp_nodes)
+    
+    # weighted_dmu2_dw = np.einsum("mg, mg->mg", dmu2_dw, var_first_layer) # shape: (M, Num_gp_nodes)
+    # weighted_dmu2_dw = np.einsum('mg,mgd->md', weighted_dmu2_dw, dmu_dx[:,:,:,0]) # shape: (M, D)
+
+    # (2)
+    # print("scale: ", scale)
+    # print("length: ", second_layer[0].length)
+
+    # for m in range(M):
+    #     if_positive_definite(V_nabla_f[m])
+
     for d in range(D):
         # partial derivative of I with respect to d-dimension x_star
         partial_I_partial_xd = np.zeros((M,N))
-        s = np.zeros((M,N))
         for p in range(num_gp_nodes):
             # chain rule: dI/dx = dI/dz_m * dz_m/dx + dI/dz_v * dz_v/dx
             # shape of d_epsilon_dx_star: (M, N)
@@ -207,9 +238,110 @@ def nabla_sexp_I(x_star:np.array, all_layers:list):
 
         nabla_I[:,:,d] = partial_I_partial_xd
 
-    return nabla_I
+    if return_variance:
+        var_dx_2 = scale/length**4 if length > 1 else scale
+        quad_term = np.einsum('mgn,nk->mgk', nabla_rw_T, second_layer[0].Rinv) # shape: (M, G, N)
+        quad_term = np.einsum('mgn,mnk->mgk', quad_term, nabla_rw) # shape: (M, G, G)
+        # print(quad_term.mean())
+        var_dx_2 = var_dx_2 + quad_term
 
-def grad_lgp(x_star, all_layers):
+        V_nabla_f = np.einsum('mdg, mgk->mdk', dmu_dx_T[:,:,:,0], var_dx_2) # shape: (M, D, G)
+        V_nabla_f = np.einsum('mdg, mgk->mdk', V_nabla_f, dmu_dx[:,:,:,0]) # shape: (M, D)
+
+        return nabla_I, V_nabla_f
+    else:
+        return nabla_I
+
+def nabla_matern_I(x_star, all_layers, return_variance=True):
+    """Compute the nabla of the I function for the Matern-2.5 kernel.
+    input: x_star: the input point
+    all_layers: all layers in the DGP model
+    return: nabla_I: the nabla of the I function about x_star
+    """
+    assert len(all_layers) == 2, "Only support two layers now."
+    assert len(all_layers[1]) == 1, "Only support one GP in the second layer now."
+    first_layer = all_layers[0]
+    second_layer = all_layers[1]
+    
+    global_input = first_layer[0].input
+    M, _ = x_star.shape
+    N, D = global_input.shape 
+    # nabla_I = np.zeros((M, N, D))
+
+    # compute the output of the first layer given x_star
+    num_gp_nodes = len(first_layer)
+    mu_first_layer = np.zeros((M, num_gp_nodes))
+    var_first_layer = np.zeros((M, num_gp_nodes))
+    dmu_dx = np.zeros((M, num_gp_nodes, D, 1)) 
+    dvar_dx = np.zeros((M, num_gp_nodes, D, 1))
+    var_dx = np.zeros((M, num_gp_nodes, D, D))
+
+    for p in range(num_gp_nodes):
+        Rinv = first_layer[p].Rinv
+        Rinv_y = first_layer[p].Rinv_y
+        scale = first_layer[p].scale[0]
+        length = first_layer[p].length
+        w1 = first_layer[p].input
+        nugget = first_layer[p].nugget
+        name = first_layer[p].name
+
+
+        mu, var = gp_pred(x=x_star, z=w1, Rinv=Rinv, Rinv_y=Rinv_y, 
+                  scale=scale, length=length, nugget=nugget, name=name)
+        mu_first_layer[:,p] = mu
+        var_first_layer[:,p] = var
+    
+        # dmu_dx
+        if name == 'sexp':
+            d_k_one_vector_d_x_star = sexp_k_one_vector_derivative(x_star, w1, length, scale)
+        elif name == 'matern2.5':
+            d_k_one_vector_d_x_star = matern_k_one_vector_derivative(x_star, w1, length, scale)
+        else:
+            raise ValueError("Only support squared exponential and Matern-2.5 kernel now.")
+        
+        d_k_one_vector_d_x_star_transpose = np.transpose(d_k_one_vector_d_x_star, (0, 2, 1)) # Shape: (M, D, N)
+        dmu_dx[:,p,:,:] = np.einsum('mdn,n->md', d_k_one_vector_d_x_star_transpose, Rinv_y)[:,:,None] # Shape: (M, D, 1)
+
+        term1 = -2*np.einsum('mdn,nk->mdk', d_k_one_vector_d_x_star_transpose, Rinv) # Shape: (M, D, N)
+        # print(k_one_vec(x_star, w1, length, name).shape)
+        term1 = np.einsum('mdn,mn->md', term1, k_one_vec(x_star, w1, length, name))[:,:,None] # Shape: (M, D)
+        dvar_dx[:,p,:,:] = scale*term1
+        
+        # # compute the variance of gradient of GP in the first layer
+        # quad_term = np.einsum('mdn,nk->mdk', d_k_one_vector_d_x_star_transpose, Rinv) # shape: (M, D, N)
+        # quad_term = np.einsum('mdn,mnk->mdk', quad_term, d_k_one_vector_d_x_star) # shape: (M, D, D)
+        # quad_term = scale/length**4 - quad_term + 1e-12*np.eye(D)[None, :, :].repeat(M,axis=0) # shape: (M, D, D)
+        # var_dx[:,p,:,:] = quad_term
+
+
+    w = second_layer[0].input
+    scale = second_layer[0].scale[0]
+    length = second_layer[0].length[0]
+    Rinv_y = second_layer[0].Rinv_y
+    
+    d_k_one_vector_d_w_star = matern_k_one_vector_derivative(mu_first_layer, 
+                                                             w, length, scale)
+    d_k_one_vector_d_w_star_transpose = np.transpose(d_k_one_vector_d_w_star, axes=(0, 2, 1)) # shape: (M, D, N)
+    dmu2_dmu1 = np.einsum('mdn,n->md', d_k_one_vector_d_w_star_transpose, Rinv_y) # shape: (M, Num_gp_nodes)
+    dmu2_dx = np.einsum('mp,mpd->md', dmu2_dmu1, dmu_dx[:,:,:,0]) # shape: (M, D)
+
+    # sq_dmu2_dmu1 = np.square(dmu2_dmu1) # shape: (M, Num_gp_nodes)
+    # var2_dx = np.einsum('mg,mgdh->mdh', sq_dmu2_dmu1, var_dx) # shape: (M, D, D)
+
+    if return_variance:
+        var2_dw = np.einsum('mdn,nk->mdk', d_k_one_vector_d_w_star_transpose, second_layer[0].Rinv) # shape: (M, D, N)
+        var2_dw = np.einsum('mdn,mnk->mdk', var2_dw, d_k_one_vector_d_w_star) # shape: (M, D, D)
+
+        var2_dx = np.einsum('mdg, mgk->mdk', np.transpose(dmu_dx[:,:,:,0],axes=(0, 2, 1)), var2_dw) # shape: (M, D, D)
+        var2_dx = np.einsum('mdg, mgk->mdk', var2_dx, dmu_dx[:,:,:,0]) # shape: (M, D)
+
+        return dmu2_dx, var2_dx
+    else:
+        return dmu2_dx
+
+
+
+def grad_lgp(x_star, all_layers, return_variance=True):
     """Compute the gradient of the linked GP for the squared exponential kernel.
     input: x_star: the input point
            all_layers: all layers in the DGP model
@@ -217,14 +349,30 @@ def grad_lgp(x_star, all_layers):
     """
     assert len(all_layers) == 2, "Only support two layers now."
     assert len(all_layers[1]) == 1, "Only support one GP in the second layer now."
-    assert all_layers[1][0].name == 'sexp', "Only support squared exponential kernel now."
+    # assert all_layers[1][0].name == 'sexp', "Only support squared exponential kernel now."
 
-    nabla_I = nabla_sexp_I(x_star, all_layers)
-    Rinv_y = all_layers[1][0].Rinv_y
-    nabla_I = np.transpose(nabla_I, axes=(0,2,1))
+    if all_layers[1][0].name == 'sexp':
+        if return_variance:
+            nabla_I, V_nabla_f = nabla_sexp_I(x_star, all_layers, return_variance=return_variance)
+            Rinv_y = all_layers[1][0].Rinv_y
+            nabla_I = np.transpose(nabla_I, axes=(0,2,1))
 
-    nabla_I_Rinv_y = np.einsum('mdn,n->md', nabla_I, Rinv_y)
-    return nabla_I_Rinv_y
+            nabla_I_Rinv_y = np.einsum('mdn,n->md', nabla_I, Rinv_y)
+
+            return nabla_I_Rinv_y, V_nabla_f
+        else:
+            nabla_I = nabla_sexp_I(x_star, all_layers, return_variance=return_variance)
+            Rinv_y = all_layers[1][0].Rinv_y
+            nabla_I = np.transpose(nabla_I, axes=(0,2,1))
+            nabla_I_Rinv_y = np.einsum('mdn,n->md', nabla_I, Rinv_y)
+
+            return nabla_I_Rinv_y
+    
+    elif all_layers[1][0].name == 'matern2.5':
+        return nabla_matern_I(x_star, all_layers, return_variance=return_variance)
+    
+    else:
+        raise ValueError("Only support squared exponential and Matern-2.5 kernel now.")
 
 
 if __name__ == "__main__":
@@ -235,7 +383,6 @@ if __name__ == "__main__":
 
     np.random.seed(123)
     nb_seed(123)
-    
 
     # Define the benchmark function
     def test_f(x):
@@ -279,10 +426,12 @@ if __name__ == "__main__":
 
 
     grad_pred = np.zeros((100, 2))
+    grad_pred_var = np.zeros((100, 2, 2))
     num_imp = len(emu.all_layer_set)
     for i in range(num_imp):
-        tmp_grad_pred = grad_lgp(grid_eval_grid, emu.all_layer_set[i])
+        tmp_grad_pred, tmp_grad_pred_var = grad_lgp(grid_eval_grid, emu.all_layer_set[i])
         grad_pred += tmp_grad_pred/num_imp
+        grad_pred_var += tmp_grad_pred_var/(10*num_imp)
 
 
     fig, ax = plt.subplots(1, 2, figsize=(12, 5))
@@ -297,6 +446,7 @@ if __name__ == "__main__":
 
     ax[1].quiver(grid_eval_grid[:, 0], grid_eval_grid[:, 1], grad_pred[:, 0], grad_pred[:, 1])
     colorbar_2 = ax[1].imshow(pred_mu.reshape(50, 50), extent=(-1, 1, -1, 1))
+    
     fig.colorbar(colorbar_2, ax=ax[1])
     ax[1].set_title("Emulator prediction", fontsize=15)
     ax[1].set_xlabel("x1", fontsize=12)
@@ -334,217 +484,6 @@ if __name__ == "__main__":
 
 
     plt.show()
-
-
-
-
-            
-
-
-
-            
-            
-
-    
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# def jax_gp_predict_sexp(x,layer):
-#     """Make GP predictions.
-#     """
-#     Rinv = layer.Rinv
-#     Rinv_y = layer.Rinv_y
-#     scale = layer.scale
-#     length = layer.length
-#     w1 = layer.input
-#     nugget = layer.nugget
-
-#     r=jax_k_one_vec_sexp(w1,x,length)
-#     Rinv_r=jnp.dot(Rinv,r)
-#     r_Rinv_r=jnp.sum(r*Rinv_r,axis=0)
-#     v=jnp.abs(scale*(1+nugget-r_Rinv_r)) 
-#     m=jnp.dot(Rinv_y, r)
-#     return m, v, length
-
-# def cond_mean_sexp(x_star, all_layer):
-#     first_layer = all_layer[0]
-#     second_layer = all_layer[1]
-#     mu_first_layer = jnp.zeros((1,len(first_layer)))
-#     var_first_layer = jnp.zeros((1,len(first_layer)))
-#     lengths = jnp.zeros(len(first_layer))
-#     for p in range(len(first_layer)):
-#         mu, var, length = jax_gp_predict_sexp(x_star, first_layer[p])
-#         mu_first_layer = mu_first_layer.at[:,p].set(mu)
-#         var_first_layer = var_first_layer.at[:,p].set(var)
-#         lengths = lengths.at[p].set(length[0])
-#     w1 = second_layer[0].input
-#     # ms, vs, lengths = vmap_predict_x_and_layer(x_star, first_layer)
-#     I = jax_I_sexp(w1, mu_first_layer, var_first_layer, lengths)
-#     Rinv_y = second_layer[0].Rinv_y
-#     IRinv_y=jnp.dot(I, Rinv_y) 
-#     return IRinv_y
-
-
-
-# def nabla_I_sexp(x_star, all_layer):
-#     # X: **w** imputated random variable
-#     # z_m: mu from last layer GP
-#     # z_v: var from last layer GP
-#     first_layer = all_layer[0]
-#     second_layer = all_layer[1]
-
-#     num_gp_nodes = len(first_layer)
-
-
-
-
- 
-
-
-# def jax_k_one_vec_sexp(X,z,length):
-#     """Compute cross-correlation matrix between the testing and training input data.
-#     """
-#     X_l=X/length
-#     z_l=z/length
-#     L_X=jnp.expand_dims(jnp.sum(X_l**2,axis=1),axis=1)
-#     L_z=jnp.sum(z_l**2,axis=1)
-#     dis2=L_X-2*jnp.dot(X_l,z_l.T)+L_z
-#     k=jnp.exp(-dis2)
-#     return k
-
-# def jax_gp_predict_sexp(x,layer):
-#     """Make GP predictions.
-#     """
-#     Rinv = layer.Rinv
-#     Rinv_y = layer.Rinv_y
-#     scale = layer.scale
-#     length = layer.length
-#     w1 = layer.input
-#     nugget = layer.nugget
-
-#     r=jax_k_one_vec_sexp(w1,x,length)
-#     Rinv_r=jnp.dot(Rinv,r)
-#     r_Rinv_r=jnp.sum(r*Rinv_r,axis=0)
-#     v=jnp.abs(scale*(1+nugget-r_Rinv_r)) 
-#     m=jnp.dot(Rinv_y, r)
-#     return m, v, length
-
-# # @jax.jit
-# def jax_I_sexp(X,z_m,z_v,length):
-#     # X: w imputated random variable
-#     # z_m: mu from last layer GP
-#     # z_v: var from last layer GP
-#     # n, d = X.shape
-#     # I = jnp.zeros(n)
-#     # X_z = X-z_m
-#     # I_coef1 = 1.
-#     # for k in range(d):
-#     #     div = 2*z_v[:,k]/length[k]**2
-#     #     I_coef1 *= 1 + div
-#     # I_coef1 = 1./jnp.sqrt(I_coef1)
-#     # for i in range(n):
-#     #     I_coef2 = 0.
-#     #     for k in range(d):
-#     #         I_coef2 += X_z[i,k]**2/(2*z_v[:,k]+length[k]**2)
-#     #     I_value = I_coef1 * jnp.exp(-I_coef2)
-#     #     I = I.at[i].set( I_value[0] )
-#     # return I
-
-
-
-#     v_l=1/(1+2*z_v/length**2)
-#     X_l=X/length
-#     m_l=z_m/length
-#     cross1=jnp.dot(X_l**2,v_l.T)
-#     cross2=2*jnp.dot(X_l,(m_l*v_l).T)
-#     L_z=jnp.sum(m_l**2*v_l,axis=1)
-#     coef = 0.5*jnp.sum(jnp.log(v_l),axis=1)
-#     dist=coef-cross1+cross2-L_z
-#     I=jnp.exp(dist.T)
-#     return I
-
-
-# # def IJ_sexp(X, z_m, z_v, length, R2sexp, Psexp):
-# #     n, d = X.shape
-# #     I = np.zeros(n)
-# #     J = np.zeros((n,n))
-# #     X_z = X-z_m
-# #     I_coef1, J_coef1 = 1., 1.
-# #     for k in range(d):
-# #         div = 2*z_v[k]/length[k]**2
-# #         I_coef1 *= 1 + div
-# #         J_coef1 *= 1 + 2*div
-# #         J += (Psexp[k]-2*z_m[k]/length[k])**2/(2+4*div)
-# #     I_coef1, J_coef1 = 1/sqrt(I_coef1), 1/sqrt(J_coef1)
-# #     J = J_coef1 * np.exp(-J) * R2sexp
-# #     for i in range(n):
-# #         I_coef2 = 0.
-# #         for k in range(d):
-# #             I_coef2 += X_z[i,k]**2/(2*z_v[k]+length[k]**2)
-# #         I[i] = I_coef1 * np.exp(-I_coef2)
-# #     return I,J
-
-
-
-
-
-
-
-# @jax.jit
-# def jax_I_matern(X,z_m,z_v,length):
-#     n, d = X.shape
-#     I = jnp.zeros(n)
-#     zX = z_m-X
-#     muA, muB = zX-sqrt(5)*z_v/length, zX+sqrt(5)*z_v/length
-#     for i in range(n):
-#         Ii = 1.
-#         for k in range(d):
-#             if z_v[k]!=0:
-#                 Ii *= np.exp((5*z_v[k]-2*sqrt(5)*length[k]*zX[i,k])/(2*length[k]**2))* \
-#                     ((1+sqrt(5)*muA[i,k]/length[k]+5*(muA[i,k]**2+z_v[k])/(3*length[k]**2))*0.5*(1+erf(muA[i,k]/sqrt(2*z_v[k])))+ \
-#                     (sqrt(5)+(5*muA[i,k])/(3*length[k]))*sqrt(0.5*z_v[k]/pi)/length[k]*np.exp(-0.5*muA[i,k]**2/z_v[k]))+ \
-#                     np.exp((5*z_v[k]+2*sqrt(5)*length[k]*zX[i,k])/(2*length[k]**2))* \
-#                     ((1-sqrt(5)*muB[i,k]/length[k]+5*(muB[i,k]**2+z_v[k])/(3*length[k]**2))*0.5*(1+erf(-muB[i,k]/sqrt(2*z_v[k])))+ \
-#                     (sqrt(5)-(5*muB[i,k])/(3*length[k]))*sqrt(0.5*z_v[k]/pi)/length[k]*np.exp(-0.5*muB[i,k]**2/z_v[k]))
-#             else:
-#                 Ii *= (1+sqrt(5)*np.abs(zX[i,k])/length[k]+5*zX[i,k]**2/(3*length[k]**2))*np.exp(-sqrt(5)*np.abs(zX[i,k])/length[k])  
-#         I = I.at[i].set(Ii)
-#     return I
-
 
 
 
