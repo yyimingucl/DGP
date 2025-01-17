@@ -3,8 +3,9 @@ from numpy.linalg import LinAlgError, lstsq, matrix_rank
 from scipy.optimize import minimize, Bounds
 from scipy.linalg import cho_solve, pinvh, cholesky
 from scipy.spatial.distance import pdist, squareform
-from .functions import Pmatrix, gp, link_gp, pdist_matern_one, pdist_matern_multi, pdist_matern_coef, fod_exp, logdet_nb, trace_nb, g
-from .vecchia import nn, vecchia_llik, vecchia_nllik, get_pred_nn, gp_vecch, imp_pointers, link_gp_vecch
+from .functions import Pmatrix, gp, gp_non_parallel, link_gp, link_gp_non_parallel, pdist_matern_one, pdist_matern_multi, pdist_matern_coef, fod_exp, logdet_nb, trace_nb, g
+from .vecchia import nn, vecchia_llik, vecchia_nllik, get_pred_nn, gp_vecch, gp_vecch_non_parallel, imp_pointers, imp_pointers_rep, link_gp_vecch, link_gp_vecch_non_parallel
+from .utils import get_thread
 class kernel:
     """
     Class that defines the GPs in the DGP hierarchy.
@@ -116,7 +117,7 @@ class kernel:
         self.input=None
         self.output=None
         self.rep=None
-        #self.rep_sp=None
+        self.rep_hetero=None
         self.Rinv=None
         self.Rinv_y=None
         self.R2sexp=None
@@ -128,9 +129,8 @@ class kernel:
         self.m=None
         self.pred_m=None
         self.NNarray=None
+        self.max_rep=None
         self.imp_NNarray=None
-        #self.pointer_row=None
-        #self.pointer_col=None
         self.imp_pointer_row=None
         self.imp_pointer_col=None
         self.nn_method='exact'
@@ -170,6 +170,10 @@ class kernel:
             state['pred_m'] = None
         if 'NNarray' not in state:
             state['NNarray'] = None
+        if 'max_rep' not in state:
+            state['max_rep'] = None
+        if 'rep_hetero' not in state:
+            state['rep_hetero'] = None    
         if 'imp_NNarray' not in state:
             state['imp_NNarray'] = None
         if 'imp_pointer_row' not in state:
@@ -224,7 +228,7 @@ class kernel:
             _, resids = lstsq(X, self.input, rcond = None)[:2]
             rsq = 1 - resids / (len(self.input) * np.var(self.input, axis=0))
             if overwritten:
-                self.R2 = rsq
+                self.R2 = np.atleast_2d(rsq)
             else:
                 self.R2 = np.vstack((self.R2,rsq))
 
@@ -257,8 +261,10 @@ class kernel:
             prev = NNs < np.tile(np.arange(n), (self.m-1, 1)).T
             NNs[prev] = NNs[prev] + n
             self.imp_NNarray = np.hstack((np.arange(n).reshape(-1,1) + n, np.arange(n).reshape(-1,1), NNs))
-            self.imp_pointer_row, self.imp_pointer_col = imp_pointers(self.imp_NNarray)
-            #self.pointer_row, self.pointer_col = pointers(self.NNarray)
+            if self.max_rep is None:
+                self.imp_pointer_row, self.imp_pointer_col = imp_pointers(self.imp_NNarray)
+            else:
+                self.imp_pointer_row, self.imp_pointer_col = imp_pointers_rep(self.imp_NNarray, self.max_rep, self.rep_hetero, self.ord)
 
     def log_t(self):
         """Log transform the model parameters (lengthscales and nugget).
@@ -554,6 +560,8 @@ class kernel:
         Returns:
             tuple: a tuple of two 1d-arrays giving the means and variances at the testing input data positions. 
         """
+        num_x, num_thread = x.shape[0], get_thread()
+        parallel = True if num_x > num_thread else False
         if self.vecch:
             if z is not None:
                 x=np.concatenate((x, z),1)
@@ -563,9 +571,15 @@ class kernel:
             NNarray = get_pred_nn(x/self.length, w/self.length, self.pred_m, method = self.nn_method)
             if self.loo_state:
                 NNarray = NNarray[:,1:]
-            m,v = gp_vecch(x,w,NNarray,self.output,self.scale[0],self.length,self.nugget[0],self.name)
+            if parallel:
+                m,v = gp_vecch(x,w,NNarray,self.output,self.scale[0],self.length,self.nugget[0],self.name)
+            else:
+                m,v = gp_vecch_non_parallel(x,w,NNarray,self.output,self.scale[0],self.length,self.nugget[0],self.name)
         else:
-            m,v=gp(x,z,self.input,self.global_input,self.Rinv,self.Rinv_y,self.scale,self.length,self.nugget,self.name)
+            if parallel:
+                m,v=gp(x,z,self.input,self.global_input,self.Rinv,self.Rinv_y,self.scale,self.length,self.nugget,self.name)
+            else:
+                m,v=gp_non_parallel(x,z,self.input,self.global_input,self.Rinv,self.Rinv_y,self.scale,self.length,self.nugget,self.name)
         return m,v
 
     def linkgp_prediction(self,m,v,z):
@@ -586,6 +600,8 @@ class kernel:
             tuple: a tuple of two 1d-arrays giving the means and variances at the testing input data positions (that are 
             represented by predictive means and variances).
         """
+        num_x, num_thread = m.shape[0], get_thread()
+        parallel = True if num_x > num_thread else False
         if self.vecch:
             if z is not None:
                 x = np.concatenate((m, z),1)
@@ -596,9 +612,15 @@ class kernel:
             NNarray = get_pred_nn(x/self.length, w/self.length, self.pred_m, method = self.nn_method)
             if self.loo_state:
                 NNarray = NNarray[:,1:]
-            m,v = link_gp_vecch(m, v, z, self.input, self.global_input, NNarray, self.output, self.scale[0], self.length, self.nugget[0], self.name)
+            if parallel:
+                m,v = link_gp_vecch(m, v, z, self.input, self.global_input, NNarray, self.output, self.scale[0], self.length, self.nugget[0], self.name)
+            else:
+                m,v = link_gp_vecch_non_parallel(m, v, z, self.input, self.global_input, NNarray, self.output, self.scale[0], self.length, self.nugget[0], self.name)
         else:
-            m,v=link_gp(m,v,z,self.input,self.global_input,self.Rinv,self.Rinv_y,self.R2sexp,self.Psexp,self.scale[0],self.length,self.nugget[0],self.name)
+            if parallel:
+                m,v=link_gp(m,v,z,self.input,self.global_input,self.Rinv,self.Rinv_y,self.R2sexp,self.Psexp,self.scale[0],self.length,self.nugget[0],self.name)
+            else:
+                m,v=link_gp_non_parallel(m,v,z,self.input,self.global_input,self.Rinv,self.Rinv_y,self.R2sexp,self.Psexp,self.scale[0],self.length,self.nugget[0],self.name)
         return m,v
 
     def linkgp_prediction_full(self,m,v,m_z,v_z,z):
@@ -620,6 +642,8 @@ class kernel:
             tuple: a tuple of two 1d-arrays giving the means and variances at the testing input data positions (that are 
             represented by predictive means and variances).
         """
+        num_x, num_thread = m.shape[0], get_thread()
+        parallel = True if num_x > num_thread else False
         m=np.concatenate((m,m_z),axis=1)
         v=np.concatenate((v,v_z),axis=1)
         idx1=np.arange(np.shape(m_z)[1])
@@ -633,7 +657,10 @@ class kernel:
                 x = m
                 w = overall_input
             NNarray = get_pred_nn(x/self.length, w/self.length, self.pred_m, method = self.nn_method)
-            m,v = link_gp_vecch(m, v, z, overall_input, self.global_input[:,idx2], NNarray, self.output, self.scale[0], self.length, self.nugget[0], self.name)
+            if parallel:     
+                m,v = link_gp_vecch(m, v, z, overall_input, self.global_input[:,idx2], NNarray, self.output, self.scale[0], self.length, self.nugget[0], self.name)
+            else:
+                m,v = link_gp_vecch_non_parallel(m, v, z, overall_input, self.global_input[:,idx2], NNarray, self.output, self.scale[0], self.length, self.nugget[0], self.name)
         else:
             if self.name=='sexp':
                 if len(self.length)==1:
@@ -649,7 +676,10 @@ class kernel:
                 Psexp = np.concatenate((self.Psexp,Psexp_global),axis=0)
             else:
                 R2sexp, Psexp = self.R2sexp, self.Psexp
-            m,v=link_gp(m,v,z,overall_input,self.global_input[:,idx2],self.Rinv,self.Rinv_y,R2sexp,Psexp,self.scale[0],self.length,self.nugget[0],self.name)
+            if parallel:
+                m,v=link_gp(m,v,z,overall_input,self.global_input[:,idx2],self.Rinv,self.Rinv_y,R2sexp,Psexp,self.scale[0],self.length,self.nugget[0],self.name)
+            else:
+                m,v=link_gp_non_parallel(m,v,z,overall_input,self.global_input[:,idx2],self.Rinv,self.Rinv_y,R2sexp,Psexp,self.scale[0],self.length,self.nugget[0],self.name)
         return m,v
 
     def compute_stats(self):

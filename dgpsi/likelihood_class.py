@@ -1,8 +1,7 @@
 import numpy as np
 from scipy.special import loggamma
 from scipy.linalg import cholesky, cho_solve
-from scipy.sparse import diags_array
-from .functions import fmvn_mu
+from .functions import categorical_sampler #fmvn_mu
 from .vecchia import backward_substitute, forward_substitute
 
 class Poisson:
@@ -35,7 +34,6 @@ class Poisson:
         self.input_dim=input_dim
         self.exact_post_idx=None
         self.rep=None
-        #self.rep_sp=None
 
     def llik(self):
         """The log-likelihood function of Poisson distribution.
@@ -107,7 +105,6 @@ class Hetero:
         self.input_dim=input_dim
         self.exact_post_idx=np.array([0])
         self.rep=None
-        #self.rep_sp=None
 
     def llik(self):
         mu,var=self.input[:,0],np.exp(self.input[:,1])
@@ -148,88 +145,35 @@ class Hetero:
                 #V_mask=v[mask_f,:][:,mask_f]
                 #mu,cov=self.post_het2(v,Gamma,v_mask,V_mask,y_mask)
                 mu,cov=self.post_het2(v,Gamma,self.rep,self.output)
-            #f_mu=np.random.default_rng().multivariate_normal(mean=mu,cov=cov,check_valid='ignore')
-            f_mu=fmvn_mu(mu,cov)
+            f_mu=np.random.multivariate_normal(mean=mu,cov=cov,check_valid='ignore')
+            #f_mu=fmvn_mu(mu,cov)
             return f_mu
         
-    def posterior_vecch(self, idx, U_sp, ord, rev_ord):
+    def posterior_vecch(self, idx, U_sp_l, U_sp_ol, ord, rev_ord):
         """Sampling from the conditional posterior distribution of the mean in heteroskedastic Gaussian likelihood under the Vecchia Approximation.
         """
         if idx==0:
-            #if self.rep is None:
-            invGamma = diags_array(np.exp(-self.input[:,1])[ord], format = 'csc')
-            f_mu = self.post_het1_vecch(U_sp, invGamma, self.output[ord,0])[rev_ord]
-            #else:
-            #    invGamma = diags_array(np.exp(-self.input[:,1]), format = 'csc')
-            #    Mt_invGamma_M = (self.rep_sp.transpose().dot(invGamma)).dot(self.rep_sp)
-            #    Mt_invGamma_M = Mt_invGamma_M[ord,:][:,ord]
-            #    invGammay = invGamma.dot(self.output[:,0])
-            #    Mt_invGammay = self.rep_sp.transpose().dot(invGammay)[ord]
-            #    f_mu = self.post_het2_vecch(U_sp, L_sp, Mt_invGamma_M, Mt_invGammay)[rev_ord]
+            if self.rep is None:
+                f_mu = self.post_het_vecch(U_sp_l, U_sp_ol, self.output[ord,0])[rev_ord]
+            else:
+                f_mu = self.post_het_vecch(U_sp_l, U_sp_ol, self.output[:,0])[rev_ord]
             return f_mu
         
     @staticmethod
-    def post_het1_vecch(U_sp, invGamma, y_mask):
+    def post_het_vecch(U_sp_l, U_sp_ol, y):
         """Calculate the conditional posterior mean and covariance of the mean 
-           of the heteroskedastic Gaussian likelihood when there are no repetitions
+           of the heteroskedastic Gaussian likelihood when there are repetitions
            in the training data under the Vecchia approximation.
         """
-        invGammay = invGamma.dot(y_mask)
-        sd = np.random.rand(len(y_mask))
-        L_sp = U_sp.transpose().tocsr()
-        # to be changed to spsolve_triangular when scipy updates with newer robust version
-        #samp = spsolve(L_sp, sd)
-        #intermediate = spsolve(U_sp, invGammay)
-        #mu = spsolve(L_sp, intermediate)
-        samp = forward_substitute(L_sp.data, L_sp.indices, L_sp.indptr, sd)
-        intermediate = backward_substitute(U_sp.data, U_sp.indices, U_sp.indptr, invGammay)
-        mu = forward_substitute(L_sp.data, L_sp.indices, L_sp.indptr, intermediate)
+        L_sp_l = U_sp_l.transpose().tocsr()
+        U_latent_obs_y = U_sp_ol.transpose().dot(y)
+        U_latent_U_latent_obs_y = U_sp_l.dot(U_latent_obs_y)
+        intermediate = backward_substitute(U_sp_l.data, U_sp_l.indices, U_sp_l.indptr, U_latent_U_latent_obs_y)
+        mu = -forward_substitute(L_sp_l.data, L_sp_l.indices, L_sp_l.indptr, intermediate)
+        sd = np.random.rand(U_sp_l.shape[0])
+        samp = forward_substitute(L_sp_l.data, L_sp_l.indices, L_sp_l.indptr, sd)
         f = mu + samp
         return f
-    
-    #@staticmethod
-    #def post_het2_vecch(U_sp_post, L_sp, invGamma, invGammay):
-    #    """Calculate the conditional posterior mean and covariance of the mean 
-    #       of the heteroskedastic Gaussian likelihood when there are repetitions
-    #       in the training data under the Vecchia approximation.
-    #    """
-    #    sd = np.random.rand(len(invGammay))
-    #    L_sp_post = U_sp_post.transpose()
-    #    U_sp = L_sp.transpose()
-    #    samp = spsolve(L_sp_post, sd)
-    #    intermediate_P_invGammay = spsolve(U_sp_post, invGammay)
-    #    P_invGammay = spsolve(L_sp_post, intermediate_P_invGammay)
-    #    Gamma_P_Gammay = invGamma.dot(P_invGammay)
-    #    Gammay_Gamma_P_Gammay = invGammay - Gamma_P_Gammay
-    #    intermediate_mu = spsolve(U_sp, Gammay_Gamma_P_Gammay)
-    #    mu = spsolve(L_sp, intermediate_mu)
-    #    f = mu + samp
-    #    return f
-        
-    #@staticmethod
-    #def post_het1_vecch(L_sp, invGamma, y_mask):
-    #    """Calculate the conditional posterior mean and covariance of the mean 
-    #       of the heteroskedastic Gaussian likelihood when there are no repetitions
-    #       in the training data under the Vecchia approximation.
-    #    """
-    #    P = (L_sp.transpose()).dot(L_sp)
-    #    invGammaP = invGamma + P
-    #    invGammay = invGamma.dot(y_mask)
-    #    cg_sampler = HetroSampler(invGammaP, L_sp, invGammay)
-    #    f = cg_sampler.sample()
-    #    return f
-    
-    #@staticmethod
-    #def post_het2_vecch(L_sp, invGamma, invGammay):
-    #    """Calculate the conditional posterior mean and covariance of the mean 
-    #       of the heteroskedastic Gaussian likelihood when there are repetitions
-    #       in the training data under the Vecchia approximation.
-    #    """
-    #    P = (L_sp.transpose()).dot(L_sp)
-    #    invGammaP = invGamma + P
-    #    cg_sampler = HetroSamplerRep(invGamma, invGammaP, L_sp, invGammay)
-    #    f = cg_sampler.sample()
-    #    return f
 
     @staticmethod
     def post_het1(v,Gamma,y_mask):
@@ -308,5 +252,82 @@ class NegBin:
         y_sample=np.random.negative_binomial(k,p)
         return y_sample.flatten()
 
+class Categorical:
+    """Class to implement categorical likelihood for binary and multi-class classifications. It can only be added as the final layer of a DGP model.
 
+    Args:
+        num_classes (int, optional): an integer indicating the number of classes in the training data.
+        input_dim (ndarray, optional): a numpy 1d-array of length one that contains the indices of one GP (if the output has two classes) and K
+            (if the output has K > 2 classes) in the feeding layer whose outputs feed into the likelihood node. When set to `None`, 
+            all outputs from GPs of the feeding layer feed into the likelihood node, and in this case one needs to ensure there is only one GP
+            node (for binary classification) or K GP nodes (for multi-class classification) specified in the feeding layer. Defaults to `None`.
+
+    Attributes:
+        type (str): identifies that the node is a likelihood node;
+        input (ndarray): a numpy 2d-array (each row as a data point and each column as a likelihood parameter from the
+            DGP part) that contains the input data (according to the argument **input_dim**) to the likelihood node. The value of 
+            this attribute is assigned during the initialisation of :class:`.dgp` class. 
+        output (ndarray): a numpy 2d-array with only one column that contains the output data to the likelihood node.
+            The value of this attribute is assigned during the initialisation of :class:`.dgp` class.
+        exact_post_idx (ndarray): a numpy 1d-array that indicates the indices of the likelihood parameters that allow closed-form
+            conditional posterior distributions. Defaults to `None`.
+        rep (ndarray): a numpy 1d-array used to re-construct repetitions in the data according to the repetitions in the global input,
+            i.e., rep is assigned during the initialisation of :class:`.dgp` class if one input position has multiple outputs. Otherwise, it is
+            `None`. Defaults to `None`. 
+    """
+    def __init__(self, num_classes=None, input_dim=None):
+        self.type='likelihood'
+        self.name='Categorical'
+        self.input=None
+        self.output=None
+        self.input_dim=input_dim
+        self.exact_post_idx=None
+        self.rep=None
+        self.num_classes=num_classes
+        self.class_encoder=None
+
+    def llik(self):
+        """The log-likelihood function of Categorical distribution.
+
+        Returns:
+            ndarray: a numpy 1d-array of log-likelihood.
+        """
+        if self.num_classes==2:
+            llik = np.sum(self.output * self.input - np.log(1 + np.exp(self.input)))
+        else: 
+            max_logits = np.max(self.input, axis=1, keepdims=True)
+            stable_exp = np.exp(self.input - max_logits)
+            log_sum_exp = np.log(np.sum(stable_exp, axis=1)) + max_logits.flatten()
+            llik = np.sum(self.input[np.arange(len(self.output)), self.output.flatten()] - log_sum_exp)
+        return llik
+    
+    def pllik(self, y, f):
+        if self.num_classes==2:
+            pllik = y * f - np.log(1 + np.exp(f))
+        else:
+            max_logits = np.max(f, axis=2, keepdims=True)
+            stable_exp = np.exp(f - max_logits)
+            log_sum_exp = np.log(np.sum(stable_exp, axis=2)) + np.squeeze(max_logits, axis=2)
+            pllik = (f[np.arange(len(y)), :, y.flatten()] - log_sum_exp)[:, :, None]
+        return pllik
+    
+    def sampling(self, f_sample, mode='prob'):
+        if self.num_classes==2:
+            if mode == 'prob':
+                prob_sample = 1 / (1 + np.exp(-f_sample))
+                y_sample = np.concatenate((1-prob_sample, prob_sample), axis=1)
+            elif mode == 'label':
+                prob_sample = 1 / (1 + np.exp(-f_sample))
+                y_sample = np.random.binomial(1, prob_sample.flatten())
+                y_sample = self.class_encoder.inverse_transform(y_sample).reshape(-1,1)
+        else:
+            if mode == 'prob':
+                exp_logit = np.exp(f_sample - np.max(f_sample, axis=1, keepdims=True))
+                y_sample = exp_logit/np.sum(exp_logit, axis=1, keepdims=True)
+            elif mode == 'label':
+                exp_logit = np.exp(f_sample - np.max(f_sample, axis=1, keepdims=True))
+                prob_sample = exp_logit/np.sum(exp_logit, axis=1, keepdims=True)
+                y_sample = categorical_sampler(prob_sample)
+                y_sample = self.class_encoder.inverse_transform(y_sample).reshape(-1,1)
+        return y_sample
         

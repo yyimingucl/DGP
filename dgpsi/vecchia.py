@@ -12,6 +12,8 @@ except ImportError:
 from psutil import cpu_count
 
 core_num = cpu_count(logical = False)
+max_threads = config.NUMBA_NUM_THREADS
+core_num = min(core_num, max_threads)
 config.THREADING_LAYER = 'workqueue'
 set_num_threads(core_num)
 
@@ -249,6 +251,31 @@ def K_vec_nb(X, z, length, name):
     return K_vec
 
 @njit(cache=True)
+def K_cross_nb(x1, x2, length, name):
+    n1, d = x1.shape
+    n2, _ = x2.shape
+    x1_l = x1/length
+    x2_l = x2/length
+    K = np.zeros((n1, n2))
+    if name == 'sexp':
+        for i in range(n1):
+            for j in range(n2):
+                dist = 0
+                for k in range(d):
+                    dist += (x1_l[i,k] - x2_l[j,k])**2
+                K[i,j] = np.exp(-dist)
+    elif name == 'matern2.5':
+        for i in range(n1):
+            for j in range(n2):
+                coef1, coef2 = 1, 0
+                for k in range(d):
+                    distk = np.abs(x1_l[i,k] - x2_l[j,k])
+                    coef1 *= 1+np.sqrt(5)*distk+(5/3)*distk**2
+                    coef2 += distk
+                K[i,j] = coef1 * np.exp(-np.sqrt(5) * coef2)
+    return K
+
+@njit(cache=True)
 def K_matrix_nb(xi, length, nugget, name):
     n, d = xi.shape
     xi_l=xi/length
@@ -419,9 +446,7 @@ def U_matrix(X, revNNarray, revCond, length, nugget, scale, gamma, name):
 @njit(cache=True)
 def imp_pointers(NNarray):
     n = NNarray.shape[0]
-    Cond = NNarray > n-1
     revNNarray = NNarray[:,::-1]
-    revCond = Cond[:,::-1]
     nentries = revNNarray.size
     rowpointers, colindices = np.zeros(nentries), np.zeros(nentries)
     cur = 0
@@ -430,13 +455,47 @@ def imp_pointers(NNarray):
         exist_n = idx>=0
         idx = idx[exist_n]
         n0 = len(idx)
-        revCond0 = revCond[i, exist_n]
-        cur_cols = np.zeros(n0)
-        cur_cols[revCond0] = idx[revCond0]
-        cur_cols[~revCond0] = idx[~revCond0]
-        rowpointers[cur + np.arange(n0)] = np.repeat(i, n0)
-        colindices[cur + np.arange(n0)] = cur_cols
+        rowpointers[cur:cur+n0] = i
+        colindices[cur:cur+n0] = idx
         cur = cur + n0
+    return rowpointers, colindices
+
+@njit(cache=True)
+def imp_pointers_rep(NNarray, max_rep, rep, ord):
+    n = NNarray.shape[0]
+    rep_len = rep.shape[0]
+    Cond = NNarray > n-1
+    revNNarray = NNarray[:,::-1]
+    revCond = Cond[:,::-1]
+    nentries = revNNarray.size * max_rep
+    rowpointers, colindices = np.full(nentries, -1), np.full(nentries, -1)
+    cur = 0
+    for i in range(n):
+        idx = revNNarray[i]
+        exist_n = idx>=0
+        idx = idx[exist_n]
+        revCond0 = revCond[i, exist_n]
+        idx_latent = idx[revCond0]
+        idx_obs = idx[~revCond0]
+        selected_order_indices = ord[idx_obs]
+        selected_order_set = set(selected_order_indices)
+        mask = np.zeros(rep_len, dtype=np.bool_)
+        for k in range(rep_len):
+            if rep[k] in selected_order_set:
+                mask[k] = True
+        obs_positions = np.where(mask)[0]
+        latent_position = idx_latent - n + rep_len
+        n0 = len(obs_positions) + len(latent_position)
+        cur_cols = np.empty(n0, dtype=np.int32)
+        cur_cols[:len(obs_positions)] = obs_positions
+        cur_cols[len(obs_positions):] = latent_position
+        rowpointers[cur:cur+n0] = i
+        colindices[cur:cur+n0] = cur_cols
+        cur = cur + n0
+    valid = rowpointers != -1
+    rowpointers = rowpointers[valid]
+    colindices = colindices[valid]
+
     return rowpointers, colindices
 
 #def L_matrix_sp(X, NNarray, scale, length, nugget, name, rows, cols):
@@ -446,6 +505,93 @@ def imp_pointers(NNarray):
 #    L = csr_matrix((data, (rows, cols)), shape=(n, n))
 #    return L
 
+@njit(cache=True, parallel=True)
+def U_matrix_rep(X, revNNarray, revCond, rep, ord, row, length, nugget, scale, gamma, name):
+    n = revNNarray.shape[0]
+    rep_len = rep.shape[0]
+    U_matrix = np.zeros(len(row))
+    for i in prange(n):
+        idx = revNNarray[i]
+        cond = revCond[i]
+        idx = idx[idx>=0]
+        cond = cond[idx>=0]
+        idx_latent = idx[cond]
+        idx_obs = idx[~cond]
+        idx_latent_prev = idx_latent[:-1]
+        idx_latent_current = idx_latent[-1]
+        selected_order_indices = ord[idx_obs]
+        selected_order_set = set(selected_order_indices)
+        rep0 = np.full(rep_len, -1)
+        for k in range(rep_len):
+            if rep[k] in selected_order_set:
+                rep0[k] = np.where(selected_order_indices == rep[k])[0][0]
+        mask0 = rep0 != -1
+        rep0_i = rep0[mask0]
+        gamma_i = gamma[mask0]
+        xi_obs = X[idx_obs,:]
+        if len(idx_latent) == 1:
+            x0 = X[idx_latent_current]
+            Ki_obs = scale * K_matrix_nb(xi_obs, length, nugget, name)
+            ki_obs_0 = scale * K_vec_nb(xi_obs, x0, length, name)
+            Li_obs = np.linalg.cholesky(Ki_obs)
+            Li_obs_mask = Li_obs[rep0_i,:]
+            ki_obs_0_mask = ki_obs_0[rep0_i]
+            ki_obs_0_mask_GammaInv = ki_obs_0_mask * (1/gamma_i)
+            Li_obs_mask_GammaInv = Li_obs_mask.T * (1/gamma_i)
+            Li_obs_mask_GammaInv_Li_obs_mask_Ii = Li_obs_mask_GammaInv@Li_obs_mask + np.eye(len(Li_obs))
+            L_Li_obs_mask_GammaInv_Li_obs_mask_Ii = np.linalg.cholesky(Li_obs_mask_GammaInv_Li_obs_mask_Ii)
+            Li_obs_mask_GammaInv_ki_obs_0_mask = np.dot(Li_obs_mask_GammaInv, ki_obs_0_mask)
+            L_Li_obs_mask_GammaInv_Li_obs_mask_Ii_Li_obs_mask_GammaInv_ki_obs_0_mask = backward_solve(L_Li_obs_mask_GammaInv_Li_obs_mask_Ii.T, forward_solve(L_Li_obs_mask_GammaInv_Li_obs_mask_Ii, Li_obs_mask_GammaInv_ki_obs_0_mask).flatten()).flatten()
+            B = ki_obs_0_mask_GammaInv - np.dot(Li_obs_mask_GammaInv.T, L_Li_obs_mask_GammaInv_Li_obs_mask_Ii_Li_obs_mask_GammaInv_ki_obs_0_mask)
+            a = scale * (1 + nugget) - np.dot(B, ki_obs_0_mask)
+            val = np.concatenate((-1/np.sqrt(a)*B, 1/np.sqrt(np.array([a]))))
+        else:
+            xi_latent = X[idx_latent_prev,:]
+            x0 = X[idx_latent_current]
+            Ki_obs = scale * K_matrix_nb(xi_obs, length, nugget, name)
+            Ki_latent = scale * K_matrix_nb(xi_latent, length, nugget, name)
+            ki_obs_latent = scale * K_cross_nb(xi_obs, xi_latent, length, name)
+            ki_obs_0 = scale * K_vec_nb(xi_obs, x0, length, name)
+            ki_latent_0 = scale * K_vec_nb(xi_latent, x0, length, name)
+            Li_obs = np.linalg.cholesky(Ki_obs)
+            Li_obs_mask = Li_obs[rep0_i,:]
+            ki_obs_latent_mask = ki_obs_latent[rep0_i,:]
+            ki_obs_0_mask = ki_obs_0[rep0_i]
+            ki_obs_0_mask_GammaInv = ki_obs_0_mask * (1/gamma_i)
+            Li_obs_mask_GammaInv = Li_obs_mask.T * (1/gamma_i)
+            Li_obs_mask_GammaInv_Li_obs_mask_Ii = Li_obs_mask_GammaInv@Li_obs_mask + np.eye(len(Li_obs))
+            Li_obs_mask_GammaInv_Li_obs_mask_Ii_Li_obs_mask_GammaInv = np.linalg.solve(Li_obs_mask_GammaInv_Li_obs_mask_Ii, Li_obs_mask_GammaInv)
+            Li_obs_mask_GammaInv_ki_obs_0_mask = np.dot(Li_obs_mask_GammaInv, ki_obs_0_mask)
+            ki_obs_0_mask_A = ki_obs_0_mask_GammaInv - np.dot(Li_obs_mask_GammaInv_Li_obs_mask_Ii_Li_obs_mask_GammaInv.T, Li_obs_mask_GammaInv_ki_obs_0_mask)
+            ki_obs_latent_mask_GammaInv = ki_obs_latent_mask.T * (1/gamma_i)
+            Li_obs_mask_Li_obs_mask_GammaInv_Li_obs_mask_Ii_Li_obs_mask_GammaInv = np.dot(Li_obs_mask, Li_obs_mask_GammaInv_Li_obs_mask_Ii_Li_obs_mask_GammaInv)
+            ki_obs_latent_mask_A = ki_obs_latent_mask_GammaInv - np.dot(ki_obs_latent_mask_GammaInv, Li_obs_mask_Li_obs_mask_GammaInv_Li_obs_mask_Ii_Li_obs_mask_GammaInv)
+            ki_obs_latent_mask_A_ki_obs_latent_mask = np.dot(ki_obs_latent_mask_A, ki_obs_latent_mask)
+            Ki_latent_ki_obs_latent_mask_A_ki_obs_latent_mask = Ki_latent - ki_obs_latent_mask_A_ki_obs_latent_mask
+            L_Ki_latent_ki_obs_latent_mask_A_ki_obs_latent_mask = np.linalg.cholesky(Ki_latent_ki_obs_latent_mask_A_ki_obs_latent_mask)
+            ki_obs_latent_mask_ki_obs_0_mask_A = np.dot(ki_obs_latent_mask.T, ki_obs_0_mask_A)
+            Ki_latent_ki_obs_latent_mask_A_ki_obs_latent_mask_ki_obs_latent_mask_ki_obs_0_mask_A = backward_solve(L_Ki_latent_ki_obs_latent_mask_A_ki_obs_latent_mask.T, forward_solve(L_Ki_latent_ki_obs_latent_mask_A_ki_obs_latent_mask, ki_obs_latent_mask_ki_obs_0_mask_A).flatten()).flatten()
+            ki_obs_latent_mask_A_Ki_latent_ki_obs_latent_mask_A_ki_obs_latent_mask_ki_obs_latent_mask_ki_obs_0_mask_A = np.dot(ki_obs_latent_mask_A.T, Ki_latent_ki_obs_latent_mask_A_ki_obs_latent_mask_ki_obs_latent_mask_ki_obs_0_mask_A)
+            Ki_latent_ki_obs_latent_mask_A_ki_obs_latent_mask_ki_latent_0 = backward_solve(L_Ki_latent_ki_obs_latent_mask_A_ki_obs_latent_mask.T, forward_solve(L_Ki_latent_ki_obs_latent_mask_A_ki_obs_latent_mask, ki_latent_0).flatten()).flatten()
+            ki_obs_latent_mask_A_Ki_latent_ki_obs_latent_mask_A_ki_obs_latent_mask_ki_latent_0 = np.dot(ki_obs_latent_mask_A.T, Ki_latent_ki_obs_latent_mask_A_ki_obs_latent_mask_ki_latent_0)
+            B1 = ki_obs_0_mask_A + ki_obs_latent_mask_A_Ki_latent_ki_obs_latent_mask_A_ki_obs_latent_mask_ki_obs_latent_mask_ki_obs_0_mask_A - ki_obs_latent_mask_A_Ki_latent_ki_obs_latent_mask_A_ki_obs_latent_mask_ki_latent_0
+            B2 = Ki_latent_ki_obs_latent_mask_A_ki_obs_latent_mask_ki_latent_0 - Ki_latent_ki_obs_latent_mask_A_ki_obs_latent_mask_ki_obs_latent_mask_ki_obs_0_mask_A
+            a = scale * (1 + nugget) - np.dot(B1, ki_obs_0_mask) - np.dot(B2, ki_latent_0)
+            val = np.concatenate((-1/np.sqrt(a)*B1, -1/np.sqrt(a)*B2, 1/np.sqrt(np.array([a]))))
+        U_matrix[row==i] = val
+    return U_matrix
+
+def U_matrix_sp_rep(X, NNarray, rep, ord, scale, length, nugget, name, gamma, rows, cols):
+    n = X.shape[0]
+    Cond = NNarray > n-1
+    revNNarray = NNarray[:,::-1]
+    revCond = Cond[:,::-1]
+    data = U_matrix_rep(np.vstack((X, X)), revNNarray, revCond, rep, ord, rows, length, nugget, scale, gamma, name)
+    U = csr_matrix((data, (cols, rows)), shape=(len(rep)+n, n))
+    U_latent = U[-n:,:]
+    U_obs_latent = U[:-n,:]
+    return U_latent, U_obs_latent
+
 def U_matrix_sp(X, NNarray, scale, length, nugget, name, gamma, rows, cols):
     n = X.shape[0]
     Cond = NNarray > n-1
@@ -453,8 +599,10 @@ def U_matrix_sp(X, NNarray, scale, length, nugget, name, gamma, rows, cols):
     revCond = Cond[:,::-1]
     U = U_matrix(np.vstack((X, X)), revNNarray, revCond, length, nugget, scale, gamma, name)
     data = U.flatten()
-    U = csr_matrix((data, (cols, rows)), shape=(2*n, n))[n::,:]
-    return U
+    U = csr_matrix((data, (cols, rows)), shape=(2*n, n))
+    U_latent = U[n::,:]
+    U_obs_latent = U[:n,:]
+    return U_latent, U_obs_latent
 
 def cond_mean_vecch(x, z, w1, global_w1, y, scale, length, nugget, name, m, nn_method):
     """Make GP mean predictions with Vecchia approximation in initialisation.
@@ -497,6 +645,23 @@ def loo_gp_vecch(x,NNarray,y,scale,length,nugget,name):
         Li = np.linalg.cholesky(Ki)
         yi = y[idx,0]
         m[i] = np.dot(Li[-1,:-1], forward_solve(Li[:-1, :-1], yi[:-1]).flatten())
+        v[i] = scale * Li[-1,-1]**2
+    return m, v
+
+@njit(cache=True)
+def gp_vecch_non_parallel(x,w,NNarray,y,scale,length,nugget,name):
+    """Make GP predictions with Vecchia approximation.
+    """
+    n_pred = x.shape[0]
+    m, v = np.zeros(n_pred), np.zeros(n_pred)
+    for i in range(n_pred):
+        idx = NNarray[i]
+        idx = idx[idx>=0]
+        Xi = np.vstack((w[idx,:], x[i:i+1,:]))
+        Ki = K_matrix_nb(Xi, length, nugget, name)
+        Li = np.linalg.cholesky(Ki)
+        yi = y[idx,0]
+        m[i] = np.dot(Li[-1,:-1], forward_solve(Li[:-1, :-1], yi).flatten())
         v[i] = scale * Li[-1,-1]**2
     return m, v
 
@@ -600,6 +765,43 @@ def link_gp_vecch(m, v, z, w1, global_w1, NNarray, y, scale, length, nugget, nam
         v_new[i] = np.abs(quad(Ji,Rinv_y)-IRinv_y**2+scale*(1+nugget-tr_RinvJ))
     return m_new,v_new
 
+@njit(cache=True)
+def link_gp_vecch_non_parallel(m, v, z, w1, global_w1, NNarray, y, scale, length, nugget, name):
+    """Make linked GP predictions.
+    """
+    n_pred = m.shape[0]
+    m_new, v_new = np.zeros(n_pred), np.zeros(n_pred)
+    if z is not None:
+        Dw=np.shape(w1)[1]
+        Dz=np.shape(z)[1]
+        if len(length)==1:
+            length=np.full(Dw+Dz, length[0])
+    else:
+        Dw=np.shape(w1)[1]
+        if len(length)==1:
+            length=np.full(Dw, length[0])
+    for i in range(n_pred):
+        idx = NNarray[i]
+        idx = idx[idx>=0]
+        yi = y[idx,0]
+        if z is not None:
+            wi, global_wi = w1[idx,:], global_w1[idx,:]
+            Izi = K_vec_nb(global_wi, z[i], length[-Dz::], name)
+            Jzi = np.outer(Izi,Izi)
+            Ii,Ji = IJ_nb(wi, m[i], v[i], length[:-Dz], name)
+            Ii,Ji = Ii*Izi, Ji*Jzi
+            Ki = K_matrix_nb(np.concatenate((wi, global_wi),1), length, nugget, name)
+        else:
+            wi = w1[idx,:]
+            Ii,Ji = IJ_nb(wi, m[i], v[i], length, name)
+            Ki = K_matrix_nb(wi, length, nugget, name)
+        tr_RinvJ=np.trace(np.linalg.solve(Ki,Ji))
+        Li = np.linalg.cholesky(Ki)
+        Rinv_y = backward_solve(Li.T, forward_solve(Li, yi).flatten()).flatten()
+        IRinv_y = np.dot(Ii,Rinv_y)
+        m_new[i] = IRinv_y
+        v_new[i] = np.abs(quad(Ji,Rinv_y)-IRinv_y**2+scale*(1+nugget-tr_RinvJ))
+    return m_new,v_new
 
 @njit(cache=True)
 def IJ_nb(X, z_m, z_v, length, name):
