@@ -40,7 +40,6 @@ def grad_gp(x_star, emu, return_variance=True):
         grad_pred_var = np.einsum('mdn,nk->mdk', np.transpose(nabla_r, (0,2,1)), emu.kernel.Rinv)
         grad_pred_var = np.einsum('mkn,mnd->mkd', grad_pred_var, nabla_r)
         grad_pred_var = grad_pred_var[:,:,0] if D == 1 else grad_pred_var
-        grad_pred_var = np.sqrt(np.clip(grad_pred_var, a_min=1e-6, a_max=None))
         return grad_pred_mu, grad_pred_var
 
 @njit(cache=True)
