@@ -1,9 +1,16 @@
 # dgpsi
-[![GitHub release (latest by date including pre-releases)](https://img.shields.io/github/v/release/mingdeyu/DGP?display_name=release&include_prereleases&style=flat-square)](https://github.com/mingdeyu/DGP/releases)
+[![GitHub release (latest by date including pre-releases)](https://img.shields.io/github/v/release/yyimingucl/DGP?display_name=release&include_prereleases&style=flat-square)](https://github.com/yyimingucl/DGP/releases)
 [![Conda](https://img.shields.io/conda/dn/conda-forge/dgpsi?label=Conda%20Downloads&style=flat-square)](https://anaconda.org/conda-forge/dgpsi)
 ![Conda](https://img.shields.io/conda/pn/conda-forge/dgpsi?color=orange&style=flat-square)
 [![Read the Docs (version)](https://img.shields.io/readthedocs/dgpsi/latest?style=flat-square)](https://dgpsi.readthedocs.io)
 [![GitHub R package version](https://img.shields.io/github/r-package/v/mingdeyu/dgpsi-R)](https://github.com/mingdeyu/dgpsi-R)
+
+This repository is a research fork of the original
+[`dgpsi`](https://github.com/mingdeyu/DGP) package. It adds efficient
+approximations to the predictive gradient distributions of GP, linked GP, and
+deep GP emulators, as developed for
+[Deep Gaussian Process Emulation with Gradient Information and Sequential
+Design for Simulators with Sharp Variations](https://arxiv.org/abs/2503.16027).
 
 ## For R users
 The `R` interface to the package is available at [`dgpsi-R`](https://github.com/mingdeyu/dgpsi-R).
@@ -29,7 +36,15 @@ The `R` interface to the package is available at [`dgpsi-R`](https://github.com/
 * ![Feature Badge](https://img.shields.io/badge/Feature-New-orange) [Efficient Approximations to the Distributions of GP/LGP/DGP Predictive Gradients.](https://github.com/yyimingucl/DGP/blob/master/demo/grad_est.ipynb)
 
 ## Installation
-`dgpsi` currently requires Python version 3.9. The package can be installed via `pip`:
+`dgpsi` currently requires Python version 3.9. To install the tagged
+gradient-enabled version used for the paper, run:
+
+```bash
+pip install "dgpsi @ git+https://github.com/yyimingucl/DGP.git@v2.5.0-grad1"
+```
+
+The upstream release of `dgpsi`, without the gradient extensions in this
+fork, can be installed via `pip`:
 
 ```bash
 pip install dgpsi
@@ -73,6 +88,17 @@ conda activate dgp_si
     conda install dgpsi
     ```
 
+## Predictive gradients
+
+The gradient functions are available from the top-level `dgpsi` namespace:
+
+```python
+from dgpsi import grad_gp, grad_lgp, grad_dgp
+
+gp_grad_mean, gp_grad_uncertainty = grad_gp(x_test, gp_emulator)
+dgp_grad_mean, dgp_grad_covariance = grad_dgp(x_test, dgp_emulator)
+```
+
 ## Demo and documentation
 Please see [demo](https://github.com/mingdeyu/DGP/tree/master/demo) for some illustrative examples of the method. The API reference 
 of the package can be accessed from [https://dgpsi.readthedocs.io](https://dgpsi.readthedocs.io).
@@ -89,8 +115,12 @@ Deyu Ming <[deyu.ming.16@ucl.ac.uk](mailto:deyu.ming.16@ucl.ac.uk)>.
 ## Research Notice
 This package is part of an ongoing research initiative. For detailed information about the research aspects and guidelines for use, please refer to our [Research Notice](./RESEARCH-NOTICE.md).
 
+This fork retains the original package authorship and MIT license. The
+predictive-gradient functionality was developed by Yiming Yang, Deyu Ming,
+and Serge Guillas for the paper cited below.
+
 ## References
-<!-- > [Yang, Y., Ming, D. and Guillas, S. (2025) Distribution of Deep Gaussian process Gradients and Sequential Design for Simulators with Sharp Variations. arXiv:2503.16027.](https://arxiv.org/pdf/2503.16027) -->
+> [Yang, Y., Ming, D. and Guillas, S. (2025) Sequential Design for Simulators with Sharp Variations via Deep Gaussian Process Gradients. arXiv:2503.16027.](https://arxiv.org/abs/2503.16027)
 
 > [Ming, D. and Williamson, D. (2023) Linked deep Gaussian process emulation for model networks. arXiv:2306.01212.](https://arxiv.org/abs/2306.01212)
 

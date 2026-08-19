@@ -101,44 +101,47 @@ sqrt_5 = np.sqrt(5.0)
 @njit(cache=True)
 def matern_k_one_vector_derivative(x_star, X, length):
     """
-    Compute the derivative of the Matern-2.5 kernel with respect to x_star.
+    Compute the derivative of the separable Matern-2.5 kernel with respect
+    to x_star.
 
     Parameters:
     - x_star: ndarray of shape (M, D), the input points where the derivative is evaluated.
     - X: ndarray of shape (N, D), the training input points.
-    - length: float, the length scale parameter (l).
+    - length: ndarray of shape (1,) or (D,), containing a shared or
+      dimension-specific length scale.
 
     Returns:
     - grad_k: ndarray of shape (M, N, D), the gradients of the kernel.
     """
     # Ensure that x_star is a 2D array [M, D]
     assert x_star.ndim == 2, "x_star should be a 2D array with shape [M, D]"
-    # Get the shapes
     M, D = x_star.shape
-    N, _ = X.shape
-    # Compute pairwise differences
-    diff = x_star[:, None, :] - X[None, :, :]  # Shape: (M, N, D)
-    # Compute squared distances and distances
-    sq_dist = np.sum(diff ** 2, axis=-1)  # Shape: (M, N)
-    r = np.sqrt(sq_dist + 1e-12)  # Add a small value to avoid division by zero
-    # Compute constants
-    l = length
-    # Compute the kernel values
+    _, X_D = X.shape
+    assert X_D == D, "x_star and X should have the same number of columns"
 
-    A = (1.0 + (sqrt_5 * r) / l + (5.0 * r ** 2) / (3.0 * l ** 2))
-    exp_part = np.exp(-sqrt_5 * r / l)
-    # k_values = A * exp_part  # Shape: (M, N)
-    # Compute the derivative of the kernel with respect to r
-    # Compute A_prime - (sqrt_5 / l) * A
-    A_prime = (sqrt_5 / l) + (10.0 * r) / (3.0 * l ** 2)
-    term = A_prime - (sqrt_5 / l) * A
-    dk_dr = term * exp_part  # Shape: (M, N)
-    # Compute the gradient
-    grad_k = np.zeros_like(diff)  # Shape: (M, N, D)
-    # Avoid division by zero
-    inv_r = 1.0 / (r + 1e-12)
-    # Compute gradient
-    grad_k = (dk_dr * inv_r)[:, :, None] * diff  # Broadcasting to shape (M, N, D)
+    if len(length) == 1:
+        ell = np.full(D, length[0])
+    else:
+        assert len(length) == D, "length should contain one or D elements"
+        ell = length
+
+    # dgpsi defines the Matern-2.5 correlation as a product of one-dimensional
+    # factors rather than as a radial kernel based on Euclidean distance.
+    diff = x_star[:, None, :] - X[None, :, :]  # Shape: (M, N, D)
+    scaled_abs_diff = np.abs(diff) / ell
+    poly = (1.0 + sqrt_5 * scaled_abs_diff
+            + (5.0 / 3.0) * scaled_abs_diff ** 2)
+    factors = poly * np.exp(-sqrt_5 * scaled_abs_diff)
+    k_values = np.ones((M, X.shape[0]))
+    for d in range(D):
+        k_values *= factors[:, :, d]
+
+    # Differentiate the relevant one-dimensional factor and multiply by all
+    # remaining factors through k_values.
+    grad_k = (k_values[:, :, None]
+              * (-(5.0 / 3.0) * diff / ell ** 2)
+              * (1.0 + sqrt_5 * scaled_abs_diff)
+              / poly)
     return grad_k
 
     
@@ -302,7 +305,7 @@ def nabla_matern_I(x_star, all_layers, return_variance=True):
 
     w = second_layer[0].input
     scale = second_layer[0].scale[0]
-    length = second_layer[0].length[0]
+    length = second_layer[0].length
     Rinv_y = second_layer[0].Rinv_y
     
     d_k_one_vector_d_w_star = matern_k_one_vector_derivative(mu_first_layer, 
@@ -519,4 +522,3 @@ if __name__ == "__main__":
 
 
     plt.show()
-            

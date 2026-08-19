@@ -3,11 +3,13 @@ import pathlib
 
 here = pathlib.Path(__file__).parent.resolve()
 
-VERSION = '2.5.0'
+VERSION = '2.5.0+grad1'
 PACKAGE_NAME = 'dgpsi'
 AUTHOR = 'Deyu Ming'
 AUTHOR_EMAIL = 'deyu.ming.16@ucl.ac.uk'
-URL = 'https://github.com/mingdeyu/DGP'
+MAINTAINER = 'Yiming Yang'
+MAINTAINER_EMAIL = 'zcahyy1@ucl.ac.uk'
+URL = 'https://github.com/yyimingucl/DGP'
 
 LICENSE = 'MIT'
 DESCRIPTION = 'Deep and Linked Gaussian Process Emulations using Stochastic Imputation'
@@ -38,6 +40,7 @@ setup(name=PACKAGE_NAME,
       long_description=LONG_DESCRIPTION,
       long_description_content_type='text/markdown',
       author=AUTHOR,
+      maintainer=MAINTAINER,
       license=LICENSE,
       keywords = ["surrogate modelling","deep learning","stochastic EM","elliptical slice sampling"],
       author_email=AUTHOR_EMAIL,

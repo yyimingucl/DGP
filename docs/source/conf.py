@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.abspath("../.."))
 project = 'Deep and Linked Gaussian Process Emulations'
 copyright = '2024, Deyu Ming'
 author = 'Deyu Ming'
-release = '2.5.0'
+release = '2.5.0+grad1'
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
@@ -33,4 +33,3 @@ autodoc_mock_imports = ['numpy.random']
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
 
 html_theme = 'sphinx_rtd_theme'
-
