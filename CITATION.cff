@@ -1,0 +1,33 @@
+cff-version: 1.2.0
+message: >-
+  If you use this gradient-enabled version of dgpsi, please cite both the
+  software release and the associated paper.
+title: dgpsi gradient extension
+type: software
+version: 2.5.0+grad1
+date-released: 2026-08-19
+repository-code: https://github.com/yyimingucl/DGP
+url: https://github.com/yyimingucl/DGP/releases/tag/v2.5.0-grad1
+license: MIT
+authors:
+  - family-names: Yang
+    given-names: Yiming
+  - family-names: Ming
+    given-names: Deyu
+  - family-names: Guillas
+    given-names: Serge
+preferred-citation:
+  type: article
+  title: >-
+    Deep Gaussian Process Emulation with Gradient Information and Sequential
+    Design for Simulators with Sharp Variations
+  authors:
+    - family-names: Yang
+      given-names: Yiming
+    - family-names: Ming
+      given-names: Deyu
+    - family-names: Guillas
+      given-names: Serge
+  year: 2025
+  doi: 10.48550/arXiv.2503.16027
+  url: https://arxiv.org/abs/2503.16027
